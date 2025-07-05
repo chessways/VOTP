@@ -1,1 +1,1 @@
-I defy anyone to point out a better otp app. I would gladly use it. 
+I defy anyone to point out a better otp app. 
