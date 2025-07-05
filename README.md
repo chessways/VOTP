@@ -1,1 +1,3 @@
-I defy anyone to point out a better otp app. 
+# Versatile One Time Pad
+
+Powerful, versatile- a one shop stop for all of your encryption and keygen needs. 
