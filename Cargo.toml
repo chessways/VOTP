@@ -1,0 +1,63 @@
+[package]
+name        = "votp"
+version     = "2.1.0"            # ← bump
+edition     = "2021"
+authors     = ["You <you@example.com>"]
+description = "Versatile, hardened one‑time‑pad XOR utility (with optional deterministic key generator)"
+license     = "MIT OR Apache-2.0"
+
+# ──────────────────────────── Dependencies ────────────────────────────────
+[dependencies]
+
+# Core CLI / ergonomics
+clap    = { version = "4.5", features = ["derive"] }
+anyhow  = "1.0"
+
+# Optional terminal progress bar (only compiled with `--features progress`)
+indicatif = { version = "0.17", optional = true }
+
+# Atomic temp‑file handling, locking, timestamps
+tempfile = "3"
+fs2      = "0.4"
+filetime = "0.2"
+
+# Security hygiene
+zeroize  = "1"
+
+# Optional extras for OTP verifier & Unix xattrs
+sha2  = { version = "0.10", optional = true, default-features = false }
+atty  = { version = "0.2",  optional = true }
+xattr = { version = "1",    optional = true }
+
+# Deterministic key generator (feature = "keygen")
+argon2      = { version = "0.5", optional = true, default-features = false }
+base64      = { version = "0.22", optional = true }
+blake3      = { version = "1.5",  optional = true }
+rand        = { version = "0.8",  optional = true, default-features = false }      # ← no_std‑friendly
+rand_chacha = { version = "0.3",  optional = true, default-features = false }      # ← no_std‑friendly
+rpassword   = { version = "7",    optional = true }
+subtle      = { version = "2.5",  optional = true }
+
+# ──────────────────────────── Feature matrix ──────────────────────────────
+[features]
+default  = []                         # lean default build (OTP transformer only)
+
+verify   = ["sha2", "atty"]           # enable SHA‑256 hash printing/comparison
+xattrs   = ["xattr"]                  # preserve Unix extended attributes
+
+# Enable the deterministic key generator sub‑command (`votp keygen …`)
+keygen   = [
+  "argon2",
+  "base64",
+  "blake3",
+  "rand",
+  "rand_chacha",
+  "rpassword",
+  "subtle",
+]
+
+# Show a live progress bar during long XOR operations
+progress = ["indicatif"]
+
+[workspace]
+resolver = "2"                        # avoids unexpected feature unification
