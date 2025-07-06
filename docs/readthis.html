@@ -2,93 +2,200 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>vot 2.0 – One‑Time‑Pad &amp; Deterministic Key CLI</title>
+<title>votp 2.1 – Versatile One‑Time‑Pad & Deterministic Key CLI</title>
+
 <style>
-body { font-family: system-ui, sans-serif; margin: 0 auto; padding: 2rem; max-width: 72rem; line-height: 1.55; }
-h1, h2, h3 { line-height: 1.2; }
+body { font-family: system-ui, sans-serif; margin:0 auto; padding:2rem; max-width:72rem; line-height:1.55; }
+h1,h2,h3 { line-height:1.2; }
 code  { font-family: ui-monospace, SFMono-Regular, monospace; }
 pre   { background:#f6f8fa; padding:1rem; overflow-x:auto; border-radius:6px; }
-pre code { font-size: .95em; }
-table { border-collapse: collapse; }
-th,td { padding:.4em .8em; border:1px solid #d0d7de; }
-.note { font-size:.9em; color:#555 }
-kbd  { background:#eee;padding:.2em .4em;border-radius:4px;font-size:.9em;border:1px solid #ccc }
+pre code { font-size:.95em; }
+table { border-collapse:collapse; }
+th,td { padding:.4em .8em; border:1px solid #d0d7de; vertical-align:top; }
+.note { font-size:.9em; color:#555; }
+kbd  { background:#eee; padding:.2em .4em; border-radius:4px; font-size:.9em; border:1px solid #ccc; }
+details summary { cursor:pointer; margin:.6em 0; font-weight:600; }
 </style>
 </head>
+
 <body>
 
-<h1>votp 2.0 – Versatile OTP transformer &amp; deterministic key generator</h1>
+<h1>votp 2.1 – Versatile OTP transformer & deterministic key generator</h1>
 
-<p><strong>votp</strong> is a single Rust binary that ships with two related tools:</p>
+<p><strong>votp</strong> is a single self‑contained Rust binary that offers two related utilities:</p>
 
 <ol>
-<li><strong><kbd>xor</kbd></strong> &nbsp;— the original streaming one‑time‑pad <em>(OTP‑like)</em> transformer</li>
-<li><strong><kbd>keygen</kbd></strong> — a password‑to‑key generator hardened with Argon2id</li>
+  <li><strong><kbd>xor</kbd></strong> &nbsp;— a streaming one‑time‑pad‑like transformer for any file or STDIN/STDOUT.</li>
+  <li><strong><kbd>keygen</kbd></strong> — a hardened, password‑to‑key generator built on Argon2id.</li>
 </ol>
 
-<p><em>Important:</em> Keys produced by <kbd>keygen</kbd> are <strong>deterministic stream‑cipher keys, not perfect OTPs</strong>. Their security rests on the strength of your password <em>and</em> a unique salt that <strong>you must provide</strong>.</p>
+<p><em>Caveat:</em> Keys produced by <kbd>keygen</kbd> are strong <em>deterministic stream‑cipher keys</em>, not perfect OTPs. Their security rests on your password <em>and</em> a unique salt <strong>you supply</strong>.</p>
+
+<hr>
+
+<h2 id="why">Why use votp?</h2>
+
+<ul>
+  <li><strong>Tiny static binaries</strong> (≈ 300 kB stripped, default build).</li>
+  <li><strong>No unsafe code.</strong></li>
+  <li><strong>Zero‑on‑drop hygiene.</strong> All key material, buffers and Argon2 seeds are wiped in RAM.</li>
+  <li><strong>Atomic, cross‑platform in‑place encryption.</strong> Uses a temp file + rename and falls back to copy‑and‑swap on cross‑device moves.</li>
+  <li><strong>Optional extras on demand</strong> (<code>verify</code>, <code>xattrs</code>, <code>keygen</code>, <code>progress</code>) keep the default binary lean.</li>
+  <li><strong>No network access, no telemetry.</strong> 100 % local.</li>
+</ul>
+
+<hr>
+
+<h2>How votp works</h2>
+
+<h3>1. <kbd>xor</kbd></h3>
+<p>The transformer reads the <em>data stream</em> and a <em>key file</em> in lock‑step, XORs them byte‑wise, and writes the result to a destination stream.</p>
+
+<ol>
+  <li>If the key is shorter than the data and neither <kbd>--min-len</kbd> nor <kbd>--strict-len</kbd> is specified, the key is repeated (like a stream cipher) and a warning is printed.</li>
+  <li>With <kbd>--in-place</kbd> the output replaces the input atomically:</li>
+  <ul>
+    <li>create hidden temp file in the same directory,</li>
+    <li>copy permissions + (timestamps &amp; xattrs if enabled),</li>
+    <li>stream‑write result, <kbd>fsync</kbd>, then <kbd>rename</kbd>.</li>
+  </ul>
+  <li>Files are <em>file‑locked</em> (shared for key, exclusive for input) to reduce race conditions.</li>
+</ol>
+
+<h3>2. <kbd>keygen</kbd></h3>
+<p>A high‑entropy key ≋ random byte stream is derived deterministically:</p>
+
+<ol>
+  <li><strong>Argon2id</strong> (&nbsp;64 MiB, 3 iterations, p = 1 ) hashes your password + salt → 32‑byte seed.</li>
+  <li>The seed expands into the requested size using either:</li>
+  <ul>
+    <li><strong>Blake3 XOF</strong> (default) – fast, SIMD.</li>
+    <li><strong>ChaCha20 RNG</strong> – cryptographically secure PRNG.</li>
+  </ul>
+  <li>All intermediate buffers and the seed are zeroised on drop.</li>
+</ol>
 
 <hr>
 
 <h2>Feature matrix</h2>
 
 <ul>
-<li><code>default</code>     – <kbd>xor</kbd> only (≈ 300 kB)</li>
-<li><code>verify</code>      – adds SHA‑256 printing / comparison</li>
-<li><code>xattrs</code>      – restores Unix extended attributes after <kbd>--in-place</kbd></li>
-<li><code>keygen</code>    – enables the deterministic key generator sub‑command</li>
+  <li><code>default</code>     – <kbd>xor</kbd> only (≈ 300 kB)</li>
+  <li><code>verify</code>      – adds SHA‑256 print/compare (<kbd>--expect HASH</kbd>)</li>
+  <li><code>xattrs</code>      – restores Unix extended attributes after <kbd>--in-place</kbd></li>
+  <li><code>keygen</code>    – enables the deterministic key generator sub‑command</li>
+  <li><code>progress</code>  – live progress bar for large streams</li>
 </ul>
 
 <hr>
 
-<h2>Keygen defaults (v 2.0.1)</h2>
-
-<ul>
-<li>Argon2id memory: <strong>64 MiB</strong></li>
-<li>Argon2id iterations: <strong>3</strong></li>
-<li><strong>A base‑64 salt is now mandatory</strong>; there is no global compile‑time salt any more.</li>
-</ul>
-
-<hr>
-
-<h2>Building</h2>
+<h2>Build variants</h2>
 
 <table>
 <thead><tr><th>Goal</th><th>Command</th><th>Size*</th></tr></thead>
 <tbody>
-<tr><td>OTP only (legacy)</td><td><pre><code>cargo build --release</code></pre></td><td>≈ 300 kB</td></tr>
+<tr><td>OTP only (lean default)</td>
+    <td><pre><code>cargo build --release</code></pre></td><td>≈ 300 kB</td></tr>
 
-<tr><td>OTP + SHA‑256 verify</td><td><pre><code>cargo build --release --features verify</code></pre></td><td>≈ 440 kB</td></tr>
+<tr><td>OTP + SHA‑256 verify</td>
+    <td><pre><code>cargo build --release --features verify</code></pre></td><td>≈ 440 kB</td></tr>
 
-<tr><td>OTP + Keygen</td><td><pre><code>cargo build --release --features keygen</code></pre></td><td>≈ 1.2 MB</td></tr>
+<tr><td>OTP + Keygen</td>
+    <td><pre><code>cargo build --release --features keygen</code></pre></td><td>≈ 1.2 MB</td></tr>
 
-<tr><td>Full kitchen‑sink</td><td><pre><code>cargo build --release --features "keygen verify xattrs"</code></pre></td><td>≈ 1.4 MB</td></tr>
+<tr><td>Full kitchen‑sink</td>
+    <td><pre><code>cargo build --release --features "keygen verify xattrs progress"</code></pre></td><td>≈ 1.4 MB</td></tr>
 </tbody>
 </table>
-
 <p class="note">*Stripped x86‑64 Linux numbers; will vary per platform.</p>
 
 <hr>
-<h2>Keygen usage (salt required)</h2>
 
-<pre><code>votp keygen 32MiB --salt AABBCCDDEEFF...== --output key.bin
+<h2>Command reference</h2>
+
+<details open>
+<summary><kbd>xor</kbd> (default)</summary>
+
+<table>
+<thead><tr><th>Flag / arg</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>-i, --input &lt;PATH&gt;</code></td><td>Source file (use <code>-</code> for STDIN). Required.</td></tr>
+<tr><td><code>-k, --key &lt;PATH&gt;</code></td><td>Key file. Defaults to <em>$OTP_KEY</em> env or <code>key.key</code>.</td></tr>
+<tr><td><code>-o, --output &lt;PATH&gt;</code></td><td>Destination file (use <code>-</code> for STDOUT). Ignored when <kbd>--in-place</kbd>.</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--in-place</code></td><td>Encrypt/decrypt atomically overwriting <code>--input</code>.</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--min-len</code></td><td>Require key&nbsp;≥ data length; abort otherwise.</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--strict-len</code></td><td>Require key&nbsp;== data length; classic OTP discipline.</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--expect HASH</code><br><span class="note">(needs <code>verify</code> feature)</span></td><td>Print or verify SHA‑256 of output.</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--progress</code><br><span class="note">(needs <code>progress</code> feature)</span></td><td>Show live progress bar.</td></tr>
+</tbody>
+</table>
+</details>
+
+<details>
+<summary><kbd>keygen</kbd></summary>
+
+<table>
+<thead><tr><th>Flag / arg</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>size</code></td><td>Required positional (e.g. <code>10MiB</code>, <code>512kB</code>). Supports <code>kb/mb/gb/kib/mib/gib</code>.</td></tr>
+<tr><td><code>-o, --output &lt;PATH&gt;</code></td><td>Destination file (default <code>key.key</code>).</td></tr>
+<tr><td><code>-a, --algo &lt;blake3|chacha&gt;</code></td><td>Output stream algorithm (default <code>blake3</code>).</td></tr>
+<tr><td><code>-s, --salt BASE64</code></td><td><strong>Mandatory</strong> base‑64 salt (≥ 12 chars).</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--argon2-memory KiB</code></td><td>Argon2 RAM usage (default = 65536).</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--argon2-time N</code></td><td>Argon2 iterations (default = 3).</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--argon2-par N</code></td><td>Argon2 lanes / parallelism (default = 1).</td></tr>
+<tr><td><code>&nbsp;&nbsp;&nbsp;--gen-salt N</code></td><td>Output a fresh random <code>N</code>-byte salt (base‑64) and exit.</td></tr>
+</tbody>
+</table>
+</details>
+
+<hr>
+
+<h2>Keygen defaults (v 2.1)</h2>
+
+<ul>
+  <li>Argon2id memory: <strong>64 MiB</strong></li>
+  <li>Argon2id iterations: <strong>3</strong></li>
+  <li>Base‑64 salt: <strong>mandatory (≥ 12 chars)</strong></li>
+</ul>
+
+<hr>
+
+<h2>Quick examples</h2>
+
+<h3>Generate a 32 MiB key with a fresh salt</h3>
+<pre><code># Generate a 16‑byte salt
+salt=$(votp keygen --gen-salt 16)
+
+# Derive key.bin deterministically
+votp keygen 32MiB --salt "$salt" --output key.bin
 </code></pre>
 
-<p>Choose a random 16‑byte (or longer) salt, encode with base‑64, and keep it
-alongside your password so the key can be reproduced.</p>
+<h3>Encrypt a file in place with classical OTP discipline</h3>
+<pre><code># key.bin must be exactly the same length as secret.jpg
+votp xor --input secret.jpg --key key.bin --strict-len --in-place
+</code></pre>
+
+<h3>Stream decrypt to STDOUT and verify SHA‑256</h3>
+<pre><code>votp xor -i - -k key.bin -o decrypted.dat --expect d2c7… &lt; ciphertext.dat
+</code></pre>
 
 <hr>
 
 <h2>Security reminders</h2>
 
 <ol>
-<li><strong>One key = one message.</strong> Never reuse OTP key bytes.</li>
-<li><strong>Key length ≥ message length</strong> for perfect secrecy. Use <kbd>--strict-len</kbd>.</li>
-<li>Deterministic keys (<kbd>keygen</kbd>) inherit password &amp; salt strength; treat both like secrets.</li>
-<li>Transport and store key material with the same (or higher) confidentiality as the data it protects.</li>
+  <li><strong>One key = one message.</strong> Never reuse OTP key bytes.</li>
+  <li><strong>Key length ≥ message length</strong> for information‑theoretic secrecy (use <kbd>--strict-len</kbd>).</li>
+  <li>Deterministic keys (<kbd>keygen</kbd>) are only as strong as their password<span class="note"> + </span>salt.</li>
+  <li>Protect key material with the same or higher confidentiality as the data.</li>
 </ol>
 
-<p class="note">When the key is shorter than the data (<kbd>xor</kbd> default), security degrades to stream‑cipher strength.</p>
+<p class="note">If the key is shorter than the data (<kbd>xor</kbd> without length flags) security falls back to <em>stream‑cipher strength</em>.</p>
+
+<hr>
+
+<footer class="note">Copyright © 2025 &nbsp;MIT / Apache‑2.0 dual license.</footer>
 
 </body>
 </html>

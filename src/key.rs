@@ -135,8 +135,8 @@ pub fn run(k: KeyArgs) -> io::Result<()> {
     }
 
     // -------- size parsing -------------------------------------------------
-    let size = parse_size(&k.size).unwrap_or_else(|| {
-        eprintln!("❌ Invalid size: '{}'", k.size);
+    let size = parse_size(&k.size).unwrap_or_else(|e| {
+        eprintln!("❌ {e}");
         process::exit(1);
     });
 
@@ -150,10 +150,10 @@ pub fn run(k: KeyArgs) -> io::Result<()> {
     }
 
     // -------- salt ---------------------------------------------------------
-    let salt_b64 = k.salt.unwrap_or_else(|| {
+    let salt_b64: Zeroizing<String> = Zeroizing::new(k.salt.unwrap_or_else(|| {
         eprintln!("❌ A unique base‑64 salt is required (use --salt).");
         process::exit(1);
-    });
+    }));
 
     if salt_b64.len() < MIN_SALT_LEN_B64 {
         eprintln!(
@@ -162,13 +162,15 @@ pub fn run(k: KeyArgs) -> io::Result<()> {
         process::exit(1);
     }
 
-    let salt_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(match B64.decode(&salt_b64) {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("❌ Salt is not valid base64");
-            process::exit(1);
-        }
-    });
+    let salt_bytes: Zeroizing<Vec<u8>> =
+        Zeroizing::new(match B64.decode(&*salt_b64) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("❌ Salt is not valid base64");
+                process::exit(1);
+            }
+        });
+    // salt_b64 will be wiped automatically on drop here
 
     // -------- derive 32‑byte seed -----------------------------------------
     println!(
@@ -249,9 +251,11 @@ where
     w.flush()
 }
 
-/// Parse sizes like 5mb, 2MiB, 123 (uses u128 to avoid f64 rounding)
-fn parse_size(arg: &str) -> Option<usize> {
-    let s = arg.trim().to_lowercase();
+/// Parse sizes like 5mb, 2MiB, 123.  Accepts optional underscores.
+/// Returns `Err` with context instead of `None` for better UX.
+fn parse_size(arg: &str) -> Result<usize, String> {
+    let s = arg.trim().to_lowercase().replace('_', "");
+
     let (num, mul): (&str, u128) = if let Some(n) = s.strip_suffix("gib") {
         (n, 1024u128.pow(3))
     } else if let Some(n) = s.strip_suffix("mib") {
@@ -268,8 +272,12 @@ fn parse_size(arg: &str) -> Option<usize> {
         (s.as_str(), 1)
     };
 
-    num.parse::<u128>()
-        .ok()
-        .and_then(|v| v.checked_mul(mul))
-        .and_then(|v| usize::try_from(v).ok())
+    let n: u128 = num
+        .parse()
+        .map_err(|_| format!("Invalid number in size specifier: '{arg}'"))?;
+    let bytes = n
+        .checked_mul(mul)
+        .ok_or_else(|| format!("Size overflow for: '{arg}'"))?;
+    usize::try_from(bytes)
+        .map_err(|_| format!("Size too large for this platform: '{arg}'"))
 }
