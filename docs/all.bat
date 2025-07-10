@@ -13,8 +13,8 @@ rem --- Build the file in one shot (>) so it’s always fresh ----------
     type "Cargo.toml"
     echo(
 
-    echo -------------[ src\error.rs ]-------------
-    type "src\error.rs"
+    echo -------------[ src\util.rs ]-------------
+    type "src\util.rs"
     echo(
 
     echo -------------[ src\key.rs ]-------------
