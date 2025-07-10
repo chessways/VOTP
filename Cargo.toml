@@ -7,7 +7,7 @@ authors     = ["You <you@example.com>"]
 description = "Versatile, hardened one‑time‑pad XOR utility (with optional deterministic key generator)"
 license     = "MIT OR Apache-2.0"
 
-# ──────────────────────────── Dependencies ────────────────────────────────
+# ──────────────────────────── Dependencies ───────────────────────────────
 [dependencies]
 
 # Core CLI / ergonomics
@@ -40,7 +40,7 @@ rand_chacha = { version = "0.3",  optional = true, default-features = false }
 rpassword   = { version = "7",    optional = true }
 subtle      = { version = "2.5",  optional = true }
 
-# ──────────────────────────── Feature matrix ──────────────────────────────
+# ──────────────────────────── Feature matrix ─────────────────────────────
 [features]
 default  = []                         # lean default build (OTP transformer only)
 
@@ -63,3 +63,8 @@ progress = ["indicatif"]
 
 [workspace]
 resolver = "2"
+
+# ─────────── Target‑specific dependencies ───────────
+[target.'cfg(windows)'.dependencies]
+windows-acl = "0.3"                        # latest published version
+winapi      = { version = "0.3", features = ["winnt"] }   # for FILE_ALL_ACCESS

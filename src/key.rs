@@ -25,6 +25,9 @@ use rpassword::prompt_password;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(windows)]
+use crate::util; // <‑‑‑ NEW
+
 /// **Updated defaults**
 const DEFAULT_ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB
 const DEFAULT_ARGON2_TIME_COST: u32 = 3;
@@ -263,7 +266,11 @@ where
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     }
-    // A proper Windows ACL fix would use the windows‑acl crate; omitted for brevity.
+
+    /* ---- tighten ACLs on Windows ------------------------------------ */
+    #[cfg(windows)]
+    util::tighten_dacl(std::path::Path::new(path))
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
     let mut w = ZeroizingWriter::new(file);
 
@@ -305,6 +312,9 @@ fn parse_size(arg: &str) -> Result<usize, String> {
     let bytes = n
         .checked_mul(mul)
         .ok_or_else(|| format!("Size overflow for: '{arg}'"))?;
+    if bytes > (isize::MAX as u128) {
+        return Err(format!("Size too large for this platform: '{arg}'"));
+    }
     usize::try_from(bytes)
         .map_err(|_| format!("Size too large for this platform: '{arg}'"))
 }

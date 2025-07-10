@@ -15,8 +15,11 @@ use std::{
     path::PathBuf,
     time::Instant,
 };
-use tempfile::Builder;
-use zeroize::Zeroize;
+
+use zeroize::Zeroize;                    // ← needed for buf.zeroize()
+
+#[cfg(feature = "progress")]
+use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "verify")]
 use atty;
@@ -27,18 +30,14 @@ use subtle::ConstantTimeEq;
 
 #[cfg(unix)]
 use filetime::{set_file_times, FileTime};
-
 #[cfg(unix)]
 use std::io::ErrorKind;
-
-#[cfg(feature = "progress")]
-use indicatif::{ProgressBar, ProgressStyle};
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
 #[cfg(feature = "keygen")]
 mod key;
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+mod util;                                 // ← new helper module
 
 const BUF_CAP: usize = 64 * 1024; // 64 KiB
 const TMP_PREFIX: &str = ".votp-tmp-";
@@ -53,6 +52,42 @@ fn is_cross_device(err: &std::io::Error) -> bool {
         return true;
     }
     matches!(err.raw_os_error(), Some(18 | 17)) // EXDEV
+}
+
+/* ------------------ Hardened output‑file creation --------------------- */
+
+fn create_output(out_path: &PathBuf) -> Result<std::fs::File> {
+    let mut opt = OpenOptions::new();
+    opt.write(true).create(true).truncate(true);
+
+    #[cfg(unix)]
+    {
+        // Reject symlinks and set close‑on‑exec.
+        opt.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let f = opt
+        .open(out_path)
+        .with_context(|| format!("creating output '{}'", out_path.display()))?;
+
+    // Lock first, then validate identity (Unix only; Windows skip).
+    FileExt::lock_exclusive(&f).context("locking output file for exclusive access")?;
+
+    #[cfg(unix)]
+    {
+        let ino_before = f.metadata()?.ino();
+        let ino_after = std::fs::metadata(out_path)?.ino();
+        if ino_before != ino_after {
+            bail!("Output file changed after locking – aborting.");
+        }
+    }
+
+    // Tighten ACLs on Windows so only owner + Administrators may read/write.
+    #[cfg(windows)]
+    util::tighten_dacl(out_path)
+        .with_context(|| format!("setting restrictive ACL on '{}'", out_path.display()))?;
+
+    Ok(f)
 }
 
 /* ─────────────────────────────── CLI ─────────────────────────────────── */
@@ -76,8 +111,8 @@ struct Cli {
     cmd: Option<Command>,
 }
 
-/// Flags for the XOR transformer
 #[derive(Parser, Debug)]
+/// Flags for the XOR transformer
 struct XorArgs {
     /// Input file (use '-' for STDIN; '--in-place' forbidden with STDIN)
     #[arg(short, long)]
@@ -196,7 +231,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
     /* -------- prepare streams ------------------------------------------ */
 
-    // Key reader (shared lock – fully‑qualified call)
+    // Key reader (shared lock)
     let mut key_file = File::open(&key_path)
         .with_context(|| format!("opening key '{}'", key_path.display()))?;
     FileExt::lock_shared(&key_file).context("locking key file")?;
@@ -210,7 +245,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
             .input
             .parent()
             .ok_or_else(|| anyhow!("cannot determine parent directory of input"))?;
-        let tmp = Builder::new()
+        let tmp = tempfile::Builder::new()
             .prefix(TMP_PREFIX)
             .tempfile_in(dir)
             .context("creating temporary file")?;
@@ -222,6 +257,10 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
         let (handle, path) = tmp.keep().context("persisting temporary file")?;
         FileExt::lock_exclusive(&handle).context("locking temporary output file")?;
+
+        #[cfg(windows)]
+        util::tighten_dacl(path.as_path())
+            .with_context(|| format!("setting restrictive ACL on '{}'", path.display()))?;
 
         #[cfg(feature = "xattrs")]
         {
@@ -236,29 +275,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
         if out_path == PathBuf::from("-") {
             (Box::new(std::io::stdout().lock()), None)
         } else {
-            /* ---- secure open: refuse symlinks, lock, detect hard‑links -- */
-            let mut opt = OpenOptions::new();
-            opt.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                opt.custom_flags(libc::O_NOFOLLOW);
-            }
-            let f = opt
-                .open(&out_path)
-                .with_context(|| format!("creating output '{}'", out_path.display()))?;
-
-            /* hard‑link check (Unix only) */
-            #[cfg(unix)]
-            {
-                if f.metadata()?.nlink() > 1 {
-                    bail!(
-                        "Refusing to overwrite file with >1 hard‑link ({}).",
-                        out_path.display()
-                    );
-                }
-            }
-
-            FileExt::lock_exclusive(&f).context("locking output file for exclusive access")?;
+            let f = create_output(&out_path)?;
             #[cfg(feature = "xattrs")]
             {
                 dest_path_for_attrs = Some(out_path.clone());
@@ -439,4 +456,3 @@ fn fill_key_slice<R: Read + Seek>(key: &mut R, dest: &mut [u8]) -> Result<()> {
     }
     Ok(())
 }
-
