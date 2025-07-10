@@ -1,14 +1,14 @@
 //! key.rs – deterministic high‑strength key material generator
 //!
-//! Build (stand‑alone):
+//! Build stand‑alone with:
 //!   cargo run --release --features keygen -- keygen 10MiB my.key
 //!
-//! Integrated with votp’s CLI as the `keygen` sub‑command.
+//! Integrated into votp’s CLI as the `keygen` sub‑command.
 
 #![cfg(feature = "keygen")]
 
 use std::{
-    fs::File,
+    fs::{self, File},
     io::{self, BufWriter, Write},
     process,
     time::Instant,
@@ -26,12 +26,10 @@ use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
 
 /// **Updated defaults**
-const DEFAULT_ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB  (portable)
+const DEFAULT_ARGON2_MEMORY_KIB: u32 = 64 * 1024; // 64 MiB
 const DEFAULT_ARGON2_TIME_COST: u32 = 3;
-const DEFAULT_ARGON2_PARALLELISM: u32 = 1;
 
-/// When no salt is supplied we *require* the user to pass one –
-/// an OTP‑like guarantee cannot survive a project‑wide constant salt.
+/// A global salt would break OTP‑like guarantees – we force a random user salt.
 const MIN_SALT_LEN_B64: usize = 12; // 9 bytes raw
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -80,8 +78,8 @@ pub struct KeyArgs {
     #[arg(long, default_value_t = DEFAULT_ARGON2_TIME_COST)]
     pub argon2_time: u32,
 
-    /// Argon2 parallelism
-    #[arg(long, default_value_t = DEFAULT_ARGON2_PARALLELISM)]
+    /// Argon2 parallelism (0 = auto)
+    #[arg(long, default_value_t = 0)]
     pub argon2_par: u32,
 
     /// Convenience helper: generate a fresh base‑64 salt of N bytes and exit
@@ -115,12 +113,11 @@ impl<W: Write> Write for ZeroizingWriter<W> {
 
 impl<W: Write> Drop for ZeroizingWriter<W> {
     fn drop(&mut self) {
-        // Scrub the buffer regardless of flushing outcome
-        self.inner.buffer_mut().zeroize();
+        self.inner.buffer_mut().zeroize(); // scrub even on panic
     }
 }
 
-/// Generate a random salt, print it in BASE64 and terminate early.
+/// Generate a random salt, print it and exit.
 fn gen_and_print_salt(n: usize) -> ! {
     let mut buf = vec![0u8; n];
     OsRng.fill_bytes(&mut buf);
@@ -128,19 +125,29 @@ fn gen_and_print_salt(n: usize) -> ! {
     process::exit(0);
 }
 
+/// Parallelism helper (0 = auto).
+fn effective_parallelism(user: u32) -> u32 {
+    if user != 0 {
+        return user;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(1)
+}
+
 pub fn run(k: KeyArgs) -> io::Result<()> {
-    // Optional quick‑salt generator path
+    /* ---------- optional salt generator fast‑path --------------------- */
     if let Some(n) = k.gen_salt {
         gen_and_print_salt(n);
     }
 
-    // -------- size parsing -------------------------------------------------
+    /* ---------- parse size ------------------------------------------- */
     let size = parse_size(&k.size).unwrap_or_else(|e| {
         eprintln!("❌ {e}");
         process::exit(1);
     });
 
-    // -------- password input + confirmation -------------------------------
+    /* ---------- password + confirm (constant‑time compare) ----------- */
     let pwd1: Zeroizing<String> = Zeroizing::new(prompt_password("🔐 Enter password: ")?);
     let pwd2: Zeroizing<String> = Zeroizing::new(prompt_password("🔐 Confirm password: ")?);
 
@@ -149,16 +156,14 @@ pub fn run(k: KeyArgs) -> io::Result<()> {
         process::exit(1);
     }
 
-    // -------- salt ---------------------------------------------------------
+    /* ---------- salt -------------------------------------------------- */
     let salt_b64: Zeroizing<String> = Zeroizing::new(k.salt.unwrap_or_else(|| {
         eprintln!("❌ A unique base‑64 salt is required (use --salt).");
         process::exit(1);
     }));
 
     if salt_b64.len() < MIN_SALT_LEN_B64 {
-        eprintln!(
-            "❌ Salt too short – provide at least {MIN_SALT_LEN_B64} base‑64 chars (~9 bytes)."
-        );
+        eprintln!("❌ Salt too short – need ≥{MIN_SALT_LEN_B64} base‑64 chars (~9 bytes).");
         process::exit(1);
     }
 
@@ -170,31 +175,39 @@ pub fn run(k: KeyArgs) -> io::Result<()> {
                 process::exit(1);
             }
         });
-    // salt_b64 will be wiped automatically on drop here
 
-    // -------- derive 32‑byte seed -----------------------------------------
+    /* ---------- salt entropy hint (soft) ----------------------------- */
+    {
+        use std::collections::HashSet;
+        if HashSet::<u8>::from_iter(salt_bytes.iter().copied()).len() <= 4 {
+            eprintln!("⚠️  Salt appears low‑entropy; consider --gen-salt.");
+        }
+    }
+
+    /* ---------- derive 32‑byte seed ---------------------------------- */
+    let par_eff = effective_parallelism(k.argon2_par);
     println!(
         "📦 Generating {size} bytes with {} / Argon2id(mem={} KiB, t={}, p={})",
-        k.algo, k.argon2_memory, k.argon2_time, k.argon2_par
+        k.algo, k.argon2_memory, k.argon2_time, par_eff
     );
 
     let start = Instant::now();
-    let mut seed = derive_seed(&pwd1, &salt_bytes, k.argon2_memory, k.argon2_time, k.argon2_par);
+    let mut seed = derive_seed(&pwd1, &salt_bytes, k.argon2_memory, k.argon2_time, par_eff);
 
-    // -------- stream key ---------------------------------------------------
+    /* ---------- stream generator ------------------------------------- */
     let result = match k.algo {
         StreamAlgo::Blake3 => write_blake3(&k.output, &seed, size),
         StreamAlgo::Chacha => write_chacha(&k.output, &seed, size),
     };
 
-    // -------- clean‑up -----------------------------------------------------
+    /* ---------- clean‑up --------------------------------------------- */
     seed.zeroize();
     result?;
     println!("✅ Key written to '{}' in {:.2?}", k.output, start.elapsed());
     Ok(())
 }
 
-/* ========== internal helpers ============================================ */
+/* ========== internal helpers =========================================== */
 
 fn derive_seed(
     password: &Zeroizing<String>,
@@ -204,12 +217,18 @@ fn derive_seed(
     par: u32,
 ) -> [u8; 32] {
     if mem > 4 * 1024 * 1024 {
-        // 4 GiB safety brake
         eprintln!("❌ argon2-memory ({mem} KiB) exceeds 4 GiB limit.");
         process::exit(1);
     }
 
-    let params = Params::new(mem, time, par, None).expect("invalid Argon2 parameters");
+    let params = match Params::new(mem, time, par, None) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("❌ invalid Argon2 parameters: {e}");
+            process::exit(1);
+        }
+    };
+
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
     let mut seed = [0u8; 32];
@@ -237,9 +256,18 @@ where
     F: FnMut(&mut [u8]),
 {
     let file = File::create(path)?;
-    let mut w = ZeroizingWriter::new(file); // ← zero‑on‑drop writer
 
-    // Zeroized‑on‑drop buffer prevents stray key material in RAM
+    /* ---- restrict permissions: owner read/write only (Unix) ---------- */
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    // A proper Windows ACL fix would use the windows‑acl crate; omitted for brevity.
+
+    let mut w = ZeroizingWriter::new(file);
+
+    // Zeroized‑on‑drop buffer keeps key material out of RAM dumps
     let mut buf = Zeroizing::new([0u8; 8192]);
 
     while remaining != 0 {
@@ -251,8 +279,7 @@ where
     w.flush()
 }
 
-/// Parse sizes like 5mb, 2MiB, 123.  Accepts optional underscores.
-/// Returns `Err` with context instead of `None` for better UX.
+/// Parse sizes like “5mb”, “2MiB”, “123”.  Accepts `_` separators.
 fn parse_size(arg: &str) -> Result<usize, String> {
     let s = arg.trim().to_lowercase().replace('_', "");
 

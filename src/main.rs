@@ -1,12 +1,14 @@
-
 //! votp 2.1 – versatile one‑time‑pad XOR transformer
 //!            + deterministic key generator (`--features keygen`)
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![deny(unsafe_code)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
+#[cfg(unix)]
+use libc; // for O_NOFOLLOW
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
@@ -20,20 +22,25 @@ use zeroize::Zeroize;
 use atty;
 #[cfg(feature = "verify")]
 use sha2::{Digest, Sha256};
+#[cfg(feature = "verify")]
+use subtle::ConstantTimeEq;
 
 #[cfg(unix)]
 use filetime::{set_file_times, FileTime};
 
 #[cfg(unix)]
-use std::io::ErrorKind; // variant `CrossDeviceLink` exists only on Unix
+use std::io::ErrorKind;
 
 #[cfg(feature = "progress")]
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[cfg(feature = "keygen")]
-mod key; // the deterministic key generator module (src/key.rs)
+mod key;
 
-const BUF_CAP: usize = 64 * 1024; // 64 KiB streaming buffers
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+const BUF_CAP: usize = 64 * 1024; // 64 KiB
 const TMP_PREFIX: &str = ".votp-tmp-";
 const DEFAULT_KEY_FILE: &str = "key.key";
 
@@ -42,13 +49,10 @@ const DEFAULT_KEY_FILE: &str = "key.key";
 /// True when the error represents a cross‑device rename failure
 fn is_cross_device(err: &std::io::Error) -> bool {
     #[cfg(unix)]
-    {
-        if err.kind() == ErrorKind::CrossDeviceLink {
-            return true;
-        }
+    if err.kind() == ErrorKind::CrossDeviceLink {
+        return true;
     }
-    // Fallback to raw OS error codes (EXDEV = 18 on POSIX, 17 on Windows)
-    matches!(err.raw_os_error(), Some(18 | 17))
+    matches!(err.raw_os_error(), Some(18 | 17)) // EXDEV
 }
 
 /* ─────────────────────────────── CLI ─────────────────────────────────── */
@@ -91,7 +95,7 @@ struct XorArgs {
     #[arg(long, conflicts_with = "output")]
     in_place: bool,
 
-    /// Require key length ≥ data length (refuse short‑key mode)
+    /// Require key length ≥ data length
     #[arg(long, conflicts_with = "strict_len")]
     min_len: bool,
 
@@ -99,12 +103,12 @@ struct XorArgs {
     #[arg(long)]
     strict_len: bool,
 
-    /// Print SHA‑256 of result or compare to EXPECT (needs --features verify)
+    /// Print/verify SHA‑256 (needs --features verify)
     #[cfg(feature = "verify")]
     #[arg(long)]
     expect: Option<String>,
 
-    /// Show a live progress bar (requires `--features progress`)
+    /// Show a live progress bar
     #[cfg(feature = "progress")]
     #[arg(long)]
     progress: bool,
@@ -113,14 +117,13 @@ struct XorArgs {
 /* ───────────────────────────── main() ─────────────────────────────────── */
 
 fn main() -> Result<()> {
-    // If the first non‑binary argument is a known sub‑command, delegate to it;
-    // otherwise we keep full backwards compatibility with the old flat XOR CLI.
-    let first_non_bin = std::env::args().nth(1);
-    let looks_like_sub = matches!(first_non_bin.as_deref(), Some("xor") | Some("keygen"));
+    // Back‑compat: if first arg looks like a sub‑command run the sub‑parser.
+    let first = std::env::args().nth(1);
+    let looks_like_sub = matches!(first.as_deref(), Some("xor") | Some("keygen"));
 
     if looks_like_sub {
         let cli = Cli::parse();
-        match cli.cmd.expect("sub‑command is present") {
+        match cli.cmd.expect("sub‑command present") {
             Command::Xor(args) => run_xor(args),
             #[cfg(feature = "keygen")]
             Command::Keygen(kargs) => key::run(kargs).map_err(|e| anyhow!(e)),
@@ -148,7 +151,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
     /* -------- source metadata (skip for STDIN) -------------------------- */
     let (data_len, src_meta_opt) = if args.input == PathBuf::from("-") {
-        (0, None) // length unknown – cannot enforce min/strict checks
+        (0, None)
     } else {
         let m = fs::metadata(&args.input)
             .with_context(|| format!("reading metadata for '{}'", args.input.display()))?;
@@ -177,18 +180,10 @@ fn run_xor(args: XorArgs) -> Result<()> {
         .len();
 
     if data_len != 0 && args.strict_len && key_len != data_len {
-        bail!(
-            "--strict-len: key length {} ≠ data length {}",
-            key_len,
-            data_len
-        );
+        bail!("--strict-len: key {} ≠ data {}", key_len, data_len);
     }
     if data_len != 0 && args.min_len && key_len < data_len {
-        bail!(
-            "--min-len: key length {} < data length {}",
-            key_len,
-            data_len
-        );
+        bail!("--min-len: key {} < data {}", key_len, data_len);
     }
 
     /* -------- warn on short‑key mode ----------------------------------- */
@@ -201,17 +196,15 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
     /* -------- prepare streams ------------------------------------------ */
 
-    // Key reader (now with fully‑qualified shared lock to silence lint)
+    // Key reader (shared lock – fully‑qualified call)
     let mut key_file = File::open(&key_path)
         .with_context(|| format!("opening key '{}'", key_path.display()))?;
-    fs2::FileExt::lock_shared(&key_file)
-        .with_context(|| "locking key file for shared access")?;
+    FileExt::lock_shared(&key_file).context("locking key file")?;
 
-    /* dest_path_for_attrs is only needed when the xattrs feature is active */
     #[cfg(feature = "xattrs")]
     let mut dest_path_for_attrs: Option<PathBuf> = None;
 
-    // Writer (tmp file when --in-place)
+    /* ----- writer: tmp file for --in-place, else out_path -------------- */
     let (mut writer, tmp_path): (Box<dyn Write>, Option<PathBuf>) = if args.in_place {
         let dir = args
             .input
@@ -228,6 +221,8 @@ fn run_xor(args: XorArgs) -> Result<()> {
         }
 
         let (handle, path) = tmp.keep().context("persisting temporary file")?;
+        FileExt::lock_exclusive(&handle).context("locking temporary output file")?;
+
         #[cfg(feature = "xattrs")]
         {
             dest_path_for_attrs = Some(args.input.clone());
@@ -241,8 +236,29 @@ fn run_xor(args: XorArgs) -> Result<()> {
         if out_path == PathBuf::from("-") {
             (Box::new(std::io::stdout().lock()), None)
         } else {
-            let f = File::create(&out_path)
+            /* ---- secure open: refuse symlinks, lock, detect hard‑links -- */
+            let mut opt = OpenOptions::new();
+            opt.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                opt.custom_flags(libc::O_NOFOLLOW);
+            }
+            let f = opt
+                .open(&out_path)
                 .with_context(|| format!("creating output '{}'", out_path.display()))?;
+
+            /* hard‑link check (Unix only) */
+            #[cfg(unix)]
+            {
+                if f.metadata()?.nlink() > 1 {
+                    bail!(
+                        "Refusing to overwrite file with >1 hard‑link ({}).",
+                        out_path.display()
+                    );
+                }
+            }
+
+            FileExt::lock_exclusive(&f).context("locking output file for exclusive access")?;
             #[cfg(feature = "xattrs")]
             {
                 dest_path_for_attrs = Some(out_path.clone());
@@ -251,7 +267,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
         }
     };
 
-    // Reader (stdin or file)
+    /* ----- reader: stdin or file --------------------------------------- */
     let mut reader: Box<dyn Read> = if args.input == PathBuf::from("-") {
         Box::new(std::io::stdin().lock())
     } else {
@@ -259,8 +275,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
             .read(true)
             .open(&args.input)
             .with_context(|| format!("opening input '{}'", args.input.display()))?;
-        f.lock_exclusive()
-            .with_context(|| "locking input file for exclusive access")?;
+        FileExt::lock_exclusive(&f).with_context(|| "locking input file for exclusive access")?;
         Box::new(f)
     };
 
@@ -280,7 +295,6 @@ fn run_xor(args: XorArgs) -> Result<()> {
     };
 
     /* -------- streaming XOR loop --------------------------------------- */
-
     let mut data_buf = vec![0u8; BUF_CAP];
     let mut key_buf = vec![0u8; BUF_CAP];
 
@@ -303,7 +317,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
         #[cfg(feature = "verify")]
         if let Some(ref mut h) = hasher_opt {
-            h.update(&data_buf[..n]); // hash in‑flight (no 2nd disk pass)
+            h.update(&data_buf[..n]);
         }
 
         writer.write_all(&data_buf[..n])?;
@@ -328,7 +342,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
         f.sync_all()?;
         if let Some(parent) = tmp.parent() {
             if let Ok(d) = File::open(parent) {
-                let _ = d.sync_all(); // best‑effort dir fsync
+                let _ = d.sync_all();
             }
         }
 
@@ -344,10 +358,8 @@ fn run_xor(args: XorArgs) -> Result<()> {
         match fs::rename(&tmp, &args.input) {
             Ok(_) => {}
             Err(e) if is_cross_device(&e) => {
-                // cross‑device: fall back to copy + atomic overwrite
-                fs::copy(&tmp, &args.input).with_context(|| "cross‑device copy")?;
+                fs::copy(&tmp, &args.input).context("cross‑device copy")?;
 
-                // --- fsync destination for full durability -----------------
                 {
                     let dest = OpenOptions::new().write(true).open(&args.input)?;
                     dest.sync_all()?;
@@ -364,12 +376,10 @@ fn run_xor(args: XorArgs) -> Result<()> {
         }
 
         #[cfg(unix)]
-        {
-            if let Some(src_meta) = src_meta_opt {
-                let atime = FileTime::from_last_access_time(&src_meta);
-                let mtime = FileTime::from_last_modification_time(&src_meta);
-                set_file_times(&args.input, atime, mtime).context("restoring timestamps")?;
-            }
+        if let Some(src_meta) = src_meta_opt {
+            let atime = FileTime::from_last_access_time(&src_meta);
+            let mtime = FileTime::from_last_modification_time(&src_meta);
+            set_file_times(&args.input, atime, mtime).context("restoring timestamps")?;
         }
     }
 
@@ -388,8 +398,12 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
         match args.expect {
             Some(expected) => {
-                if digest.to_lowercase() != expected.to_lowercase() {
-                    bail!("SHA‑256 mismatch! expected {expected}, got {digest}");
+                let got = digest.to_lowercase();
+                let want = expected.to_lowercase();
+                if got.len() != want.len()
+                    || got.as_bytes().ct_eq(want.as_bytes()).unwrap_u8() == 0
+                {
+                    bail!("SHA‑256 mismatch! expected {want}, got {got}");
                 }
                 eprintln!("✓ SHA‑256 verified");
             }
@@ -407,8 +421,7 @@ fn run_xor(args: XorArgs) -> Result<()> {
 
 /* ───────────────────────────── Helpers ─────────────────────────────────── */
 
-/// Fill `dest` completely with bytes from `key`, rewinding on EOF.
-/// Abort if the key file disappears while streaming.
+/// Fill `dest` with bytes from `key`, rewinding on EOF.
 fn fill_key_slice<R: Read + Seek>(key: &mut R, dest: &mut [u8]) -> Result<()> {
     let mut filled = 0;
     while filled < dest.len() {
@@ -426,3 +439,4 @@ fn fill_key_slice<R: Read + Seek>(key: &mut R, dest: &mut [u8]) -> Result<()> {
     }
     Ok(())
 }
+
